@@ -22,7 +22,6 @@ This project demonstrates **event-driven microservices** with AWS Lambda, Dynamo
 The system follows an **event-driven serverless design**:  
 
 ![AWS Serverless Architecture](docs/architecture-diagram.png)  
-*(Replace with your uploaded PNG — put it in a `/docs` folder)*  
 
 **Main Components:**
 - `orders_handler.py` → Manages orders  
