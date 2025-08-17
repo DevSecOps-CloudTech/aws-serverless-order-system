@@ -1,0 +1,384 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Complex event-driven serverless starter for AWS Infrastructure Composer.
+  Includes: Cognito (auth), HTTP API (JWT), 4 Lambdas (orders, payments, inventory, shipping),
+  3 DynamoDB tables, EventBridge bus & rule, SQS queue, and a Step Functions order workflow.
+  NOTE: Provide Lambda code artifacts after import (S3 bucket & key params).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ComposerDemo
+    Description: Project/application name prefix
+  Stage:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Deployment stage (e.g., dev, test, prod)
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket that holds Lambda deployment packages
+  OrdersCodeKey:
+    Type: String
+    Description: S3 key for Orders function .zip
+  PaymentsCodeKey:
+    Type: String
+    Description: S3 key for Payments function .zip
+  InventoryCodeKey:
+    Type: String
+    Description: S3 key for Inventory function .zip
+  ShippingCodeKey:
+    Type: String
+    Description: S3 key for Shipping function .zip
+
+Globals: {}
+
+Resources:
+
+  ############################################################
+  # Authentication (Amazon Cognito)
+  ############################################################
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${Stage}-up'
+      AutoVerifiedAttributes: [ email ]
+      UsernameAttributes: [ email ]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-${Stage}-upc'
+      GenerateSecret: false
+      SupportedIdentityProviders: [ COGNITO ]
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+      CallbackURLs: [ 'http://localhost:3000/callback' ]
+      LogoutURLs: [ 'http://localhost:3000/logout' ]
+
+  ############################################################
+  # API (Amazon API Gateway HTTP API v2) with JWT auth
+  ############################################################
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-${Stage}-httpapi'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+        AllowHeaders: ['*']
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  HttpApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      Name: !Sub '${ProjectName}-${Stage}-jwt-auth'
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+
+  ############################################################
+  # Data (DynamoDB)
+  ############################################################
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Stage}-orders'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Stage}-inventory'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sku
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sku
+          KeyType: HASH
+
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Stage}-products'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+
+  ############################################################
+  # Messaging (SQS + EventBridge)
+  ############################################################
+  OrderEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Stage}-order-events'
+
+  AppEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-${Stage}-bus'
+
+  OrderCreatedToQueueRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Stage}-order-created-to-queue'
+      EventBusName: !Ref AppEventBus
+      EventPattern:
+        source: [ 'app.orders' ]
+        detail-type: [ 'OrderCreated' ]
+      Targets:
+        - Id: OrderEventsQueueTarget
+          Arn: !GetAtt OrderEventsQueue.Arn
+  AllowEventBridgeToSendToSQS:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref OrderEventsQueue ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeSendMessage
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrderEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderCreatedToQueueRule.Arn
+
+  ############################################################
+  # Lambda Execution Role (shared minimal for demo)
+  ############################################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Stage}-lambda-exec'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AppInlineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !GetAtt InventoryTable.Arn
+                  - !GetAtt ProductsTable.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt AppEventBus.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt OrderEventsQueue.Arn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: '*'  # Narrow in prod to state machine ARN
+
+  ############################################################
+  # Lambda Functions (code artifacts to be supplied)
+  ############################################################
+  OrdersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Stage}-orders-fn'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          EVENTBUS_NAME: !Ref AppEventBus
+          ORDER_WORKFLOW_ARN: !Ref OrderWorkflow
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref OrdersCodeKey
+
+  PaymentsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Stage}-payments-fn'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Timeout: 15
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref PaymentsCodeKey
+
+  InventoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Stage}-inventory-fn'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          INVENTORY_TABLE: !Ref InventoryTable
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref InventoryCodeKey
+
+  ShippingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Stage}-shipping-fn'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Timeout: 15
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref ShippingCodeKey
+
+  ############################################################
+  # API Integrations & Routes
+  ############################################################
+  OrdersIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrdersFunction.Arn}/invocations'
+      PayloadFormatVersion: '2.0'
+  OrdersRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /orders'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref HttpApiAuthorizer
+      Target: !Sub 'integrations/${OrdersIntegration}'
+
+  # Allow API Gateway to invoke Lambda
+  OrdersInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrdersFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/orders'
+
+  ############################################################
+  # Step Functions - Order Orchestration
+  ############################################################
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Stage}-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt PaymentsFunction.Arn
+                  - !GetAtt InventoryFunction.Arn
+                  - !GetAtt ShippingFunction.Arn
+
+  OrderWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Stage}-order-wf'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      StateMachineType: STANDARD
+      Definition:
+        Comment: Order processing workflow
+        StartAt: TakePayment
+        States:
+          TakePayment:
+            Type: Task
+            Resource: !GetAtt PaymentsFunction.Arn
+            Next: ReserveInventory
+          ReserveInventory:
+            Type: Task
+            Resource: !GetAtt InventoryFunction.Arn
+            Next: ArrangeShipping
+          ArrangeShipping:
+            Type: Task
+            Resource: !GetAtt ShippingFunction.Arn
+            End: true
+
+  ############################################################
+  # Outputs
+  ############################################################
+  Outputs:
+    ApiEndpoint:
+      Description: HTTPS endpoint for the HTTP API
+      Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+    UserPoolId:
+      Value: !Ref UserPool
+    UserPoolClientId:
+      Value: !Ref UserPoolClient
+    OrdersTableName:
+      Value: !Ref OrdersTable
+    InventoryTableName:
+      Value: !Ref InventoryTable
+    ProductsTableName:
+      Value: !Ref ProductsTable
+    EventBusName:
+      Value: !Ref AppEventBus
+    OrderEventsQueueUrl:
+      Value: !Ref OrderEventsQueue
+    OrderWorkflowArn:
+      Value: !Ref OrderWorkflow
